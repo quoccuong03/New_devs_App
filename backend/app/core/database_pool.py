@@ -1,52 +1,61 @@
-import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import QueuePool
 import logging
+from typing import AsyncIterator
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from ..config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def build_async_database_url(database_url: str) -> str:
+    """Convert a plain postgres URL into one that uses the asyncpg driver."""
+    for prefix in ("postgresql+asyncpg://", "postgresql://", "postgres://"):
+        if database_url.startswith(prefix):
+            return "postgresql+asyncpg://" + database_url[len(prefix):]
+    raise ValueError(f"Unsupported database URL scheme: {database_url.split('://', 1)[0]}")
+
 
 class DatabasePool:
     def __init__(self):
         self.engine = None
         self.session_factory = None
-        
+
     async def initialize(self):
-        """Initialize database connection pool"""
+        """Initialize database connection pool (idempotent)."""
+        if self.session_factory is not None:
+            return
         try:
-            # Create async engine with connection pooling
-            database_url = f"postgresql+asyncpg://{settings.supabase_db_user}:{settings.supabase_db_password}@{settings.supabase_db_host}:{settings.supabase_db_port}/{settings.supabase_db_name}"
-            
+            # Async engines use AsyncAdaptedQueuePool by default; passing QueuePool is rejected by SQLAlchemy.
             self.engine = create_async_engine(
-                database_url,
-                poolclass=QueuePool,
+                build_async_database_url(settings.database_url),
                 pool_size=20,  # Number of connections to maintain
                 max_overflow=30,  # Additional connections when needed
                 pool_pre_ping=True,  # Validate connections
                 pool_recycle=3600,  # Recycle connections every hour
                 echo=False  # Set to True for SQL debugging
             )
-            
+
             self.session_factory = async_sessionmaker(
                 bind=self.engine,
                 class_=AsyncSession,
                 expire_on_commit=False
             )
-            
+
             logger.info("✅ Database connection pool initialized")
-            
+
         except Exception as e:
             logger.error(f"❌ Database pool initialization failed: {e}")
             self.engine = None
             self.session_factory = None
-    
+
     async def close(self):
         """Close database connections"""
         if self.engine:
             await self.engine.dispose()
-    
-    async def get_session(self) -> AsyncSession:
-        """Get database session from pool"""
+        self.engine = None
+        self.session_factory = None
+
+    def get_session(self) -> AsyncSession:
+        """Get a database session from the pool, for use as `async with db_pool.get_session() as session`."""
         if not self.session_factory:
             raise Exception("Database pool not initialized")
         return self.session_factory()
@@ -54,7 +63,8 @@ class DatabasePool:
 # Global database pool instance
 db_pool = DatabasePool()
 
-async def get_db_session() -> AsyncSession:
+async def get_db_session() -> AsyncIterator[AsyncSession]:
     """Dependency to get database session"""
+    await db_pool.initialize()
     async with db_pool.get_session() as session:
         yield session
